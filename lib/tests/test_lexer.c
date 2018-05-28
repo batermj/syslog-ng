@@ -139,7 +139,7 @@ _current_lloc(void)
 #define assert_parser_number(expected) \
   _next_token();                                                        \
   assert_token_type(LL_NUMBER);                                        \
-  cr_assert_eq(_current_token()->num, expected, "Unexpected number parsed %d != %d", _current_token()->num, expected);
+  cr_assert_eq(_current_token()->num, expected, "Unexpected number parsed %lld != %lld", _current_token()->num, expected);
 
 #define assert_parser_float(expected)                           \
   _next_token();                                                        \
@@ -363,6 +363,36 @@ Test(lexer, include_statement_without_at_sign)
   _input("@define include-path \"" TESTDATA_DIR "/include-test\"\n\
 include \"foo.conf\";\n");
   assert_parser_identifier("foo");
+  cfg_lexer_pop_context(lexer);
+}
+
+static gboolean
+_fake_generator_generate(CfgBlockGenerator *self, GlobalConfig *cfg, CfgArgs *args, GString *result,
+                         const gchar *reference)
+{
+  g_string_append(result, "fake_generator_content");
+  return TRUE;
+}
+
+CfgBlockGenerator *
+fake_generator_new(void)
+{
+  CfgBlockGenerator *self = g_new0(CfgBlockGenerator, 1);
+  cfg_block_generator_init_instance(self, LL_CONTEXT_ROOT, "fake-generator");
+  self->generate = _fake_generator_generate;
+  return self;
+}
+
+Test(lexer, generator_plugins_are_expanded)
+{
+  CfgLexer *lexer = parser->lexer;
+
+  CfgBlockGenerator *gen = fake_generator_new();
+  cfg_lexer_register_generator_plugin(&configuration->plugin_context, gen);
+  parser->lexer->ignore_pragma = FALSE;
+  cfg_lexer_push_context(parser->lexer, main_parser.context, main_parser.keywords, main_parser.name);
+  _input("fake-generator();\n");
+  assert_parser_identifier("fake_generator_content");
   cfg_lexer_pop_context(lexer);
 }
 

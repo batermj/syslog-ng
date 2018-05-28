@@ -47,6 +47,7 @@ typedef struct
   gboolean peer_verify;
   short int method_type;
   glong timeout;
+  GString *body_buffer;
   LogTemplate *body_template;
   LogTemplateOptions template_options;
 } HTTPDestinationDriver;

@@ -122,6 +122,21 @@ _get_curl_headers(HTTPDestinationDriver *self, LogMessage *msg)
   return curl_headers;
 }
 
+static void
+_append_body(HTTPDestinationDriver *self, GString *result, LogMessage *msg)
+{
+  if (self->body_template)
+    {
+      log_template_append_format(self->body_template, msg, &self->template_options, LTZ_SEND,
+                                 self->super.seq_num, NULL, result);
+    }
+  else
+    {
+      g_string_append(result, log_msg_get_value(msg, LM_V_MESSAGE, NULL));
+      g_string_append_c(result, '\n');
+    }
+}
+
 static const gchar *
 _get_body(HTTPDestinationDriver *self, LogMessage *msg)
 {
@@ -260,13 +275,51 @@ _map_http_status_to_worker_status(glong http_code)
   return retval;
 }
 
+/* we flush the accumulated data if
+ *   1) we reach batch_size,
+ *   2) the message queue becomes empty
+ */
 static worker_insert_result_t
-_insert(LogThreadedDestDriver *s, LogMessage *msg)
+_flush_batched_messages(HTTPDestinationDriver *self)
 {
   CURLcode ret;
   worker_insert_result_t retval;
 
-  HTTPDestinationDriver *self = (HTTPDestinationDriver *) s;
+  _set_payload(self, NULL, self->body_buffer->str);
+  if ((ret = curl_easy_perform(self->curl)) != CURLE_OK)
+    {
+      msg_error("curl: error sending HTTP request",
+                evt_tag_str("error", curl_easy_strerror(ret)),
+                log_pipe_location_tag(&self->super.super.super.super));
+
+      return WORKER_INSERT_RESULT_NOT_CONNECTED;
+    }
+
+  g_string_truncate(self->body_buffer, 0);
+  glong http_code = 0;
+  curl_easy_getinfo (self->curl, CURLINFO_RESPONSE_CODE, &http_code);
+  retval = _map_http_status_to_worker_status(http_code);
+
+  return retval;
+}
+
+static worker_insert_result_t
+_insert_batched(HTTPDestinationDriver *self, LogMessage *msg)
+{
+  _append_body(self, self->body_buffer, msg);
+
+  if (self->super.batch_size < self->batch_size)
+    {
+      return WORKER_INSERT_RESULT_QUEUED;
+    }
+  return _flush_batched_messages(self);
+}
+
+static worker_insert_result_t
+_insert_single(HTTPDestinationDriver *self, LogMessage *msg)
+{
+  CURLcode ret;
+  worker_insert_result_t retval;
 
   struct curl_slist *curl_headers = _get_curl_headers(self, msg);
   const gchar *body = _get_body(self, msg);
@@ -276,7 +329,7 @@ _insert(LogThreadedDestDriver *s, LogMessage *msg)
     {
       msg_error("curl: error sending HTTP request",
                 evt_tag_str("error", curl_easy_strerror(ret)),
-                log_pipe_location_tag(&s->super.super.super));
+                log_pipe_location_tag(&self->super.super.super.super));
 
       curl_slist_free_all(curl_headers);
 
@@ -290,6 +343,17 @@ _insert(LogThreadedDestDriver *s, LogMessage *msg)
   curl_slist_free_all(curl_headers);
 
   return retval;
+}
+
+static worker_insert_result_t
+_insert(LogThreadedDestDriver *s, LogMessage *msg)
+{
+  HTTPDestinationDriver *self = (HTTPDestinationDriver *) s;
+
+  if (self->batch_size > 1)
+    return _insert_batched(self, msg);
+  else
+    return _insert_single(self, msg);
 }
 
 void
@@ -532,6 +596,8 @@ http_dd_free(LogPipe *s)
 
   log_template_options_destroy(&self->template_options);
 
+  g_string_free(self->body_buffer, TRUE);
+
   curl_easy_cleanup(self->curl);
   curl_global_cleanup();
 
@@ -565,6 +631,7 @@ http_dd_new(GlobalConfig *cfg)
   self->super.worker.disconnect = _disconnect;
   self->super.worker.insert = _insert;
   self->super.super.super.super.generate_persist_name = _format_persist_name;
+  self->super.worker.worker_message_queue_empty = (void (*)(LogThreadedDestDriver *)) _flush_batched_messages;
   self->super.format.stats_instance = _format_stats_instance;
   self->super.stats_source = SCS_HTTP;
   self->super.super.super.super.free_fn = http_dd_free;
@@ -573,6 +640,8 @@ http_dd_new(GlobalConfig *cfg)
 
   self->ssl_version = CURL_SSLVERSION_DEFAULT;
   self->peer_verify = TRUE;
+  self->batch_size = 10;
+  self->body_buffer = g_string_sized_new(4096);
 
   return &self->super.super.super;
 }

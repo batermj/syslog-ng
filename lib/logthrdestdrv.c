@@ -42,12 +42,14 @@ void
 log_threaded_dest_driver_ack_messages(LogThreadedDestDriver *self, gint batch_size)
 {
   log_queue_ack_backlog(self->worker.queue, batch_size);
+  self->batch_size -= batch_size;
 }
 
 void
 log_threaded_dest_driver_rewind_messages(LogThreadedDestDriver *self, gint batch_size)
 {
   log_queue_rewind_backlog(self->worker.queue, batch_size);
+  self->batch_size -= batch_size;
 }
 
 static gchar *
@@ -190,7 +192,7 @@ void
 _drop_batch_and_message(LogThreadedDestDriver *self, LogMessage *msg)
 {
   stats_counter_add(self->dropped_messages, self->batch_size);
-  __accept_batch_and_message(self, msg);
+  _accept_batch_and_message(self, msg);
 }
 
 /* NOTE: runs in the worker thread */
@@ -291,6 +293,7 @@ _perform_inserts(LogThreadedDestDriver *self)
     {
       if (self->worker.worker_message_queue_empty)
         {
+          /* FIXME: error handling */
           self->worker.worker_message_queue_empty(self);
         }
     }

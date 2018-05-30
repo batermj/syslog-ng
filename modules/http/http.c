@@ -285,6 +285,9 @@ _flush_batched_messages(HTTPDestinationDriver *self)
   CURLcode ret;
   worker_insert_result_t retval;
 
+msg_debug("curl flushing",
+          evt_tag_long("len", self->body_buffer->len),
+          evt_tag_str("body", self->body_buffer->str));
   _set_payload(self, NULL, self->body_buffer->str);
   if ((ret = curl_easy_perform(self->curl)) != CURLE_OK)
     {
@@ -295,10 +298,12 @@ _flush_batched_messages(HTTPDestinationDriver *self)
       return WORKER_INSERT_RESULT_NOT_CONNECTED;
     }
 
-  g_string_truncate(self->body_buffer, 0);
   glong http_code = 0;
   curl_easy_getinfo (self->curl, CURLINFO_RESPONSE_CODE, &http_code);
   retval = _map_http_status_to_worker_status(http_code);
+
+  if (retval == WORKER_INSERT_RESULT_SUCCESS || retval == WORKER_INSERT_RESULT_DROP)
+    g_string_truncate(self->body_buffer, 0);
 
   return retval;
 }
@@ -308,11 +313,21 @@ _insert_batched(HTTPDestinationDriver *self, LogMessage *msg)
 {
   _append_body(self, self->body_buffer, msg);
 
-  if (self->super.batch_size < self->batch_size)
+  if (self->body_buffer->len <= 32768)
     {
+msg_debug("curl not flushing", evt_tag_long("len", self->body_buffer->len));
       return WORKER_INSERT_RESULT_QUEUED;
     }
+msg_debug("curl initiating flush", evt_tag_long("len", self->body_buffer->len));
   return _flush_batched_messages(self);
+}
+
+static void
+_on_message_queue_empty(HTTPDestinationDriver *self)
+{
+  gint retval = _flush_batched_messages(self);
+  if (retval == WORKER_INSERT_RESULT_SUCCESS || retval == WORKER_INSERT_RESULT_DROP || WORKER_INSERT_RESULT_NOT_CONNECTED)
+    log_threaded_dest_driver_ack_messages(&self->super, self->super.batch_size);
 }
 
 static worker_insert_result_t
@@ -350,7 +365,7 @@ _insert(LogThreadedDestDriver *s, LogMessage *msg)
 {
   HTTPDestinationDriver *self = (HTTPDestinationDriver *) s;
 
-  if (self->batch_size > 1)
+  if (1)
     return _insert_batched(self, msg);
   else
     return _insert_single(self, msg);
@@ -631,7 +646,7 @@ http_dd_new(GlobalConfig *cfg)
   self->super.worker.disconnect = _disconnect;
   self->super.worker.insert = _insert;
   self->super.super.super.super.generate_persist_name = _format_persist_name;
-  self->super.worker.worker_message_queue_empty = (void (*)(LogThreadedDestDriver *)) _flush_batched_messages;
+  self->super.worker.worker_message_queue_empty = _on_message_queue_empty;
   self->super.format.stats_instance = _format_stats_instance;
   self->super.stats_source = SCS_HTTP;
   self->super.super.super.super.free_fn = http_dd_free;
@@ -640,8 +655,7 @@ http_dd_new(GlobalConfig *cfg)
 
   self->ssl_version = CURL_SSLVERSION_DEFAULT;
   self->peer_verify = TRUE;
-  self->batch_size = 10;
-  self->body_buffer = g_string_sized_new(4096);
+  self->body_buffer = g_string_sized_new(32768);
 
   return &self->super.super.super;
 }
